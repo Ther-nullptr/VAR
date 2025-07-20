@@ -35,7 +35,7 @@ class VAR(nn.Module):
         
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
-        
+
         self.patch_nums: Tuple[int] = patch_nums
         self.L = sum(pn ** 2 for pn in self.patch_nums)
         self.first_l = self.patch_nums[0] ** 2
@@ -121,7 +121,7 @@ class VAR(nn.Module):
             h = resi + self.blocks[-1].drop_path(h)
         else:                               # fused_add_norm is not used
             h = h_or_h_and_residual
-        return self.head(self.head_nm(h.float(), cond_BD).float()).float()
+        return self.head(self.head_nm(h, cond_BD)).float()
     
     @torch.no_grad()
     def autoregressive_infer_cfg(
@@ -157,6 +157,7 @@ class VAR(nn.Module):
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
         for b in self.blocks: b.attn.kv_caching(True)
+        # self.patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L

@@ -18,3 +18,13 @@ local_output*
 *.log
 *.txt
 *.ipynb
+
+var_d*/
+
+attention_heads/
+feature_map/
+feature_map_input/
+feature_map_output/
+feature_map_weight/
+k_cache/
+v_cache/

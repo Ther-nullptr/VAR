@@ -40,6 +40,9 @@ class FFN(nn.Module):
         self.act = nn.GELU(approximate='tanh')
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop, inplace=True) if drop > 0 else nn.Identity()
+        self.cache = None
+        self.prev_size = 6
+        self.post_size = 8
     
     def forward(self, x):
         if self.fused_mlp_func is not None:
@@ -49,7 +52,23 @@ class FFN(nn.Module):
                 heuristic=0, process_group=None,
             ))
         else:
-            return self.drop(self.fc2( self.act(self.fc1(x)) ))
+            if x.shape[1] != self.post_size**2:
+                result = self.drop(self.fc2(self.act(self.fc1(x))))
+                if x.shape[1] == self.prev_size**2:
+                    # cache
+                    self.cache = result
+            else:
+                # import ipdb; ipdb.set_trace()  # Debugging breakpoint
+                # self.cache: [b, 13^2, 1024] -> [b, 13, 13, 1024]
+                result = self.cache.view(x.shape[0], self.prev_size, self.prev_size, -1)
+                # [b, 13, 13, 1024] -> [b, 16, 16, 1024]
+                result = result.permute(0, 3, 1, 2)  # [b, 1024, 13, 13]
+                result = F.interpolate(result, size=(self.post_size, self.post_size), mode='bilinear', align_corners=True)
+                result = result.permute(0, 2, 3, 1)  # [b, 16, 16, 1024]
+                # [b, 16, 16, 1024] -> [b, 256, 1024]
+                result = result.view(result.shape[0], self.post_size**2, -1)  # [b, 256, 1024]
+            # result = self.drop(self.fc2( self.act(self.fc1(x))))
+            return result
     
     def extra_repr(self) -> str:
         return f'fused_mlp_func={self.fused_mlp_func is not None}'
@@ -71,15 +90,17 @@ class SelfAttention(nn.Module):
         else:
             self.scale = 0.25 / math.sqrt(self.head_dim)
         
-        self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
-        self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
+        self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=True)
+        # self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
+        # self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
         
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = nn.Dropout(proj_drop, inplace=True) if proj_drop > 0 else nn.Identity()
         self.attn_drop: float = attn_drop
         self.using_flash = flash_if_available and flash_attn_func is not None
         self.using_xform = flash_if_available and memory_efficient_attention is not None
+        
+        self.softmax = torch.nn.Softmax(dim=-1)
         
         # only used during inference
         self.caching, self.cached_k, self.cached_v = False, None, None
@@ -89,37 +110,73 @@ class SelfAttention(nn.Module):
     # NOTE: attn_bias is None during inference because kv cache is enabled
     def forward(self, x, attn_bias):
         B, L, C = x.shape
-        
-        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
-        main_type = qkv.dtype
-        # qkv: BL3Hc
-        
-        using_flash = self.using_flash and attn_bias is None and qkv.dtype != torch.float32
-        if using_flash or self.using_xform: q, k, v = qkv.unbind(dim=2); dim_cat = 1   # q or k or v: BLHc
-        else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); dim_cat = 2               # q or k or v: BHLc
-        
-        if self.attn_l2_norm:
-            scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
-            if using_flash or self.using_xform: scale_mul = scale_mul.transpose(1, 2)  # 1H11 to 11H1
-            q = F.normalize(q, dim=-1).mul(scale_mul)
-            k = F.normalize(k, dim=-1)
-        
-        if self.caching:
-            if self.cached_k is None: self.cached_k = k; self.cached_v = v
-            else: k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat); v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
-        
-        dropout_p = self.attn_drop if self.training else 0.0
-        if using_flash:
-            oup = flash_attn_func(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), dropout_p=dropout_p, softmax_scale=self.scale).view(B, L, C)
-        elif self.using_xform:
-            oup = memory_efficient_attention(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), attn_bias=None if attn_bias is None else attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1), p=dropout_p, scale=self.scale).view(B, L, C)
+        if True:
+            # qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
+            qkv = self.mat_qkv(x).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
+            main_type = qkv.dtype
+            # qkv: BL3Hc
+            
+            using_flash = self.using_flash and attn_bias is None and qkv.dtype != torch.float32
+            if using_flash or self.using_xform: q, k, v = qkv.unbind(dim=2); dim_cat = 1   # q or k or v: BLHc
+            else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); dim_cat = 2               # q or k or v: BHLc
+            
+            if self.attn_l2_norm:
+                scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
+                if using_flash or self.using_xform: scale_mul = scale_mul.transpose(1, 2)  # 1H11 to 11H1
+                q = F.normalize(q, dim=-1).mul(scale_mul)
+                k = F.normalize(k, dim=-1)
+            
+            if self.caching:
+                if self.cached_k is None: 
+                    self.cached_k = k; self.cached_v = v
+                else:
+                    k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat); v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
+            
+            dropout_p = self.attn_drop if self.training else 0.0
+            if using_flash:
+                oup = flash_attn_func(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), dropout_p=dropout_p, softmax_scale=self.scale).view(B, L, C)
+            elif self.using_xform:
+                oup = memory_efficient_attention(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), attn_bias=None if attn_bias is None else attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1), p=dropout_p, scale=self.scale).view(B, L, C)
+            else:
+                # oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
+                attn = q.mul(self.scale) @ k.transpose(-2, -1) # BHLc @ BHcL => BHLL
+                if attn_bias is not None: 
+                    attn.add_(attn_bias)
+                oup = self.softmax(attn) @ v
+                oup = oup.transpose(1, 2).reshape(B, L, C)
+            
+            result = self.proj_drop(self.proj(oup))
+            # if L == 100:
+            #     # cache
+            #     self.cache = result
         else:
-            oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
+            # import ipdb; ipdb.set_trace()  # Debugging breakpoint
+            result = self.cache.view(x.shape[0], 13, 13, -1)
+            # [b, 13, 13, 1024] -> [b, 16, 16, 1024]
+            result = result.permute(0, 3, 1, 2)  # [b, 1024, 13, 13]
+            result = F.interpolate(result, size=(16, 16), mode='bilinear', align_corners=True)
+            result = result.permute(0, 2, 3, 1)  # [b, 16, 16, 1024]
+            # [b, 16, 16, 1024] -> [b, 256, 1024]
+            result = result.view(result.shape[0], 256, -1)  # [b, 256, 1024]
+        return result
         
-        return self.proj_drop(self.proj(oup))
-        # attn = (q @ k.transpose(-2, -1)).add_(attn_bias + self.local_rpb())  # BHLc @ BHcL => BHLL
-        # attn = self.attn_drop(attn.softmax(dim=-1))
-        # oup = (attn @ v).transpose_(1, 2).reshape(B, L, -1)     # BHLL @ BHLc = BHLc => BLHc => BLC
+        # if x.shape[1] != 256:
+        #     result = self.drop(self.fc2( self.act(self.fc1(x))))
+        #     if x.shape[1] == 169:
+        #         # cache
+        #         self.cache = result
+        # else:
+        #     # import ipdb; ipdb.set_trace()  # Debugging breakpoint
+        #     # self.cache: [b, 13^2, 1024] -> [b, 13, 13, 1024]
+        #     result = self.cache.view(x.shape[0], 13, 13, -1)
+        #     # [b, 13, 13, 1024] -> [b, 16, 16, 1024]
+        #     result = result.permute(0, 3, 1, 2)  # [b, 1024, 13, 13]
+        #     result = F.interpolate(result, size=(16, 16), mode='bilinear', align_corners=True)
+        #     result = result.permute(0, 2, 3, 1)  # [b, 16, 16, 1024]
+        #     # [b, 16, 16, 1024] -> [b, 256, 1024]
+        #     result = result.view(result.shape[0], 256, -1)  # [b, 256, 1024]
+            
+        # return result
     
     def extra_repr(self) -> str:
         return f'using_flash={self.using_flash}, using_xform={self.using_xform}, attn_l2_norm={self.attn_l2_norm}'
