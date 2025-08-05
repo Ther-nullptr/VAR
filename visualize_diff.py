@@ -9,19 +9,20 @@ if __name__ == '__main__':
         for i in range(len(patch_size)):
             for j in range(len(patch_size)):
                 if j >= i:
-                    data1 = torch.load(f'/home/wyj24/project/VAR/feature_map_output/blocks.{layer}.ffn.fc2_{patch_size[i]**2}_output.pt')
-                    data2 = torch.load(f'/home/wyj24/project/VAR/feature_map_output/blocks.{layer}.ffn.fc2_{patch_size[j]**2}_output.pt')
+                    data1 = torch.load(f'/home/wyj24/project/VAR/feature_map_output/blocks.{layer}.attn.proj_{patch_size[i]**2}_output.pt')
+                    data2 = torch.load(f'/home/wyj24/project/VAR/feature_map_output/blocks.{layer}.attn.proj_{patch_size[j]**2}_output.pt')
                     
-                    data1 = data1.view(patch_size[i], patch_size[i], 1024)
-                    data2 = data2.view(patch_size[j], patch_size[j], 1024)
+                    data1 = data1.view(data1.shape[0], patch_size[i], patch_size[i], 1024)
+                    data2 = data2.view(data2.shape[0], patch_size[j], patch_size[j], 1024)
                     
                     # interpolate data1 to match data2's shape [8, 8, 1024] -> [13, 13, 1024]
                     data1_interp = torch.nn.functional.interpolate(
-                        data1.permute(2, 0, 1).unsqueeze(0),
+                        data1.permute(0, 3, 1, 2),
                         size=(patch_size[j], patch_size[j]),
                         mode='bilinear',
                         align_corners=True
-                    ).squeeze(0).permute(1, 2, 0)
+                    ).permute(0, 2, 3, 1)
+                    data1_interp = data1_interp.view(data1_interp.shape[0], -1, 1024)
                     
                     # data1_interp = data1_interp - data1_interp.mean()  # Normalize
                     # data2 = data2 - data2.mean()
@@ -39,7 +40,7 @@ if __name__ == '__main__':
         plt.title(f'Cosine Similarity Matrix for Layer {layer}')
         plt.xlabel('Patch Size')
         plt.ylabel('Patch Size')
-        plt.savefig(f'cosine_similarity_layer_{layer}_d16_ffn.png')
+        plt.savefig(f'cosine_similarity/cosine_similarity_layer_{layer}_d16_ffn.png')
         plt.close()
-        print(f'Cosine similarity matrix for layer {layer} saved as cosine_similarity_layer_{layer}_d16.png')
+        print(f'Cosine similarity matrix for layer {layer} saved as cosine_similarity_layer_{layer}_d16_ffn.png')
         print('-' * 50)

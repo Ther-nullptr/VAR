@@ -26,6 +26,7 @@ class VAR(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        use_cache=False, calibration=False, sim_path=None, threshold=0.7
     ):
         super().__init__()
         # 0. hyperparameters
@@ -89,6 +90,7 @@ class VAR(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
                 attn_l2_norm=attn_l2_norm,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+                use_cache=use_cache, calibration=calibration, threshold=threshold,
             )
             for block_idx in range(depth)
         ])
@@ -114,6 +116,35 @@ class VAR(nn.Module):
         # 6. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
+        
+        # 7. cache for autoregressive inference(mlp)
+        self.use_cache = use_cache
+        self.calibration = calibration
+        if self.use_cache:
+            self.cache_mlp = [None for _ in range(depth)]
+            self.cache_attn = [None for _ in range(depth)]
+            
+            if self.calibration:
+                self.cache_similarity_mlp = torch.zeros((depth, len(patch_nums)-1))
+                self.cache_similarity_attn = torch.zeros((depth, len(patch_nums)-1))
+                print('initial calibration for similarity')
+            else:
+                self.cache_similarity_mlp = torch.load(sim_path)['mlp']
+                self.cache_similarity_attn = torch.load(sim_path)['attn']
+                print(f'load similarity data from {sim_path}')
+                # compute the values that higher than threshold
+                skip_index_mlp = self.cache_similarity_mlp > threshold
+                skip_index_attn = self.cache_similarity_attn > threshold
+                skip_ratio_mlp = (skip_index_mlp.sum()) / (self.cache_similarity_mlp.numel())
+                skip_ratio_attn = (skip_index_attn.sum()) / (self.cache_similarity_attn.numel())
+                print(f'cache similarity skip ratio: {skip_ratio_mlp:.2%} (threshold={threshold})')
+                print(f'cache similarity skip ratio: {skip_ratio_attn:.2%} (threshold={threshold})')
+        else:
+            self.cache_mlp = None
+            self.cache_attn = None
+            self.cache_similarity_mlp = None
+            self.cache_similarity_attn = None
+
     
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
@@ -156,18 +187,26 @@ class VAR(nn.Module):
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
-        for b in self.blocks: b.attn.kv_caching(True)
+        for b in self.blocks: 
+            b.attn.kv_caching(True)
         # self.patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
-            cur_L += pn*pn
+            cur_L += pn * pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+                x = b(
+                    x=x, 
+                    cond_BD=cond_BD_or_gss, 
+                    attn_bias=None, 
+                    cache_similarity_attn=self.cache_similarity_attn, 
+                    cache_similarity_mlp=self.cache_similarity_mlp, 
+                    cache_mlp=self.cache_mlp, 
+                    cache_attn=self.cache_attn
+                )
             logits_BlV = self.get_logits(x, cond_BD)
             
             t = cfg * ratio
@@ -218,7 +257,6 @@ class VAR(nn.Module):
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
         
-        AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)

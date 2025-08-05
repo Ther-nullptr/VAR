@@ -28,3 +28,5 @@ feature_map_output/
 feature_map_weight/
 k_cache/
 v_cache/
+
+cosine_similarity/

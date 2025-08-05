@@ -19,7 +19,7 @@ def forward_hook(module, input, output):
         print(f'Linear layer: {module.name}, input shape: {input[0].shape}, output shape: {output.shape}')
         data = input[0][0]
         torch.save(data, f'feature_map_input/{module.name}_{input[0][0].shape[0]}_input.pt')
-        torch.save(output[0], f'feature_map_output/{module.name}_{output[0].shape[0]}_output.pt')
+        torch.save(output, f'feature_map_output/{module.name}_{output[1].shape[0]}_output.pt')
 
 if __name__ == '__main__':
     MODEL_DEPTH = 16    # TODO: =====> please specify MODEL_DEPTH <=====
@@ -50,7 +50,6 @@ if __name__ == '__main__':
     for name, module in var.named_modules():
         module.name = name
         if isinstance(module, torch.nn.Linear):
-            module.name = name
             module.register_forward_hook(forward_hook)  # register hook to visualize input feature map
 
 
@@ -65,7 +64,7 @@ if __name__ == '__main__':
     seed = 0 #@param {type:"number"}
     torch.manual_seed(seed)
     cfg = 1.5 #@param {type:"slider", min:1, max:10, step:0.1}
-    class_labels = [i for i in range(1)]  #@param {type:"raw"}
+    class_labels = [i for i in range(4)]  #@param {type:"raw"}
     more_smooth = False # True for more smooth output
 
     # seed
