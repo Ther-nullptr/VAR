@@ -38,6 +38,7 @@ print_usage() {
     echo "  --device DEVICE       Device to use (default: cuda)"
     echo "  --batch_size SIZE     Batch size (default: 16)"
     echo "  --num_samples NUM     Number of samples (default: 100)"
+    echo "  --model_depth DEPTH   Model depth: 16, 20, 24, or 30 (default: 16)"
     echo "  --skip_stages LIST    Comma-separated skip stages (for custom mode)"
     echo "  --cache_stages LIST   Comma-separated cache stages (for custom mode)"
     echo "  --threshold VALUE     Cache similarity threshold (default: 0.7)"
@@ -82,6 +83,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --num_samples)
             NUM_SAMPLES="$2"
+            shift 2
+            ;;
+        --model_depth)
+            MODEL_DEPTH="$2"
             shift 2
             ;;
         --skip_stages)
@@ -139,7 +144,11 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # Common arguments
+<<<<<<< HEAD
 COMMON_ARGS="--model_path $MODEL_PATH --vae_path $VAE_PATH --output_dir $OUTPUT_DIR --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --cache_threshold $THRESHOLD $SAVE_IMAGES"
+=======
+COMMON_ARGS="--model_path \"$MODEL_PATH\" --vae_path \"$VAE_PATH\" --output_dir \"$OUTPUT_DIR\" --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --model-depth $MODEL_DEPTH --cache_threshold $THRESHOLD $SAVE_IMAGES"
+>>>>>>> a09394ca59f574e0d268dfc210684160aa4f35ce
 
 echo "=============================================="
 echo "Enhanced VAR Evaluation"
@@ -149,6 +158,7 @@ echo "VAE: $VAE_PATH"
 echo "Command: $COMMAND"
 echo "Output: $OUTPUT_DIR"
 echo "Device: $DEVICE"
+echo "Model Depth: $MODEL_DEPTH"
 echo "=============================================="
 
 case $COMMAND in
