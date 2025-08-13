@@ -13,6 +13,10 @@ DEVICE="cuda"
 BATCH_SIZE=64
 NUM_SAMPLES=50
 
+# Cache control defaults (can be overridden)
+ENABLE_ATTN_CACHE=true
+ENABLE_MLP_CACHE=true
+
 # Print usage information
 print_usage() {
     echo "Enhanced VAR Evaluation Script"
@@ -42,13 +46,18 @@ print_usage() {
     echo "  --skip_stages LIST    Comma-separated skip stages (for custom mode)"
     echo "  --cache_stages LIST   Comma-separated cache stages (for custom mode)"
     echo "  --threshold VALUE     Cache similarity threshold (default: 0.7)"
+    echo "  --enable_attn_cache   Enable attention layer caching (default: true)"
+    echo "  --disable_attn_cache  Disable attention layer caching"
+    echo "  --enable_mlp_cache    Enable MLP layer caching (default: true)"
+    echo "  --disable_mlp_cache   Disable MLP layer caching"
     echo "  --save_images         Save generated images"
     echo "  --help               Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 --model_path model.pth --vae_path vae.pth original-cache"
     echo "  $0 --model_path model.pth --vae_path vae.pth --save_images benchmark"
-    echo "  $0 --model_path model.pth --vae_path vae.pth compare"
+    echo "  $0 --model_path model.pth --vae_path vae.pth --disable_mlp_cache original-cache"
+    echo "  $0 --model_path model.pth --vae_path vae.pth --enable_attn_cache --disable_mlp_cache compare"
     echo "  $0 --model_path model.pth --vae_path vae.pth --skip_stages \"169,256\" --cache_stages \"100,169\" custom"
 }
 
@@ -101,6 +110,22 @@ while [[ $# -gt 0 ]]; do
             THRESHOLD="$2"
             shift 2
             ;;
+        --enable_attn_cache)
+            ENABLE_ATTN_CACHE=true
+            shift
+            ;;
+        --disable_attn_cache)
+            ENABLE_ATTN_CACHE=false
+            shift
+            ;;
+        --enable_mlp_cache)
+            ENABLE_MLP_CACHE=true
+            shift
+            ;;
+        --disable_mlp_cache)
+            ENABLE_MLP_CACHE=false
+            shift
+            ;;
         --save_images)
             SAVE_IMAGES="--save_images"
             shift
@@ -143,8 +168,28 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
+# Generate cache control arguments
+generate_cache_args() {
+    local cache_args=""
+    if [[ "$ENABLE_ATTN_CACHE" == "true" ]]; then
+        cache_args="$cache_args --enable_attn_cache"
+    else
+        cache_args="$cache_args --disable_attn_cache"
+    fi
+    
+    if [[ "$ENABLE_MLP_CACHE" == "true" ]]; then
+        cache_args="$cache_args --enable_mlp_cache"
+    else
+        cache_args="$cache_args --disable_mlp_cache"
+    fi
+    
+    echo "$cache_args"
+}
+
+CACHE_ARGS=$(generate_cache_args)
+
 # Common arguments
-COMMON_ARGS="--model_path $MODEL_PATH --vae_path $VAE_PATH --output_dir $OUTPUT_DIR --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --model-depth $MODEL_DEPTH --cache_threshold $THRESHOLD $SAVE_IMAGES"
+COMMON_ARGS="--model_path $MODEL_PATH --vae_path $VAE_PATH --output_dir $OUTPUT_DIR --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --model-depth $MODEL_DEPTH --cache_threshold $THRESHOLD $CACHE_ARGS $SAVE_IMAGES"
 
 echo "=============================================="
 echo "Enhanced VAR Evaluation"
@@ -171,7 +216,6 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "169,256" \
             --cache_stages "100,169" \
-            --enable_attn_cache --enable_mlp_cache \
             --generate --benchmark
         ;;
     
@@ -180,7 +224,6 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "100,169,256" \
             --cache_stages "64,100,169" \
-            --enable_attn_cache --enable_mlp_cache \
             --generate --benchmark
         ;;
     
@@ -189,12 +232,12 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "256" \
             --cache_stages "169" \
-            --enable_attn_cache --enable_mlp_cache \
             --generate --benchmark
         ;;
     
     attn-only-cache)
         echo "Running with attention-only caching..."
+        # Override user settings for this specific preset
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "169,256" \
             --cache_stages "100,169" \
@@ -204,6 +247,7 @@ case $COMMAND in
     
     mlp-only-cache)
         echo "Running with MLP-only caching..."
+        # Override user settings for this specific preset
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "169,256" \
             --cache_stages "100,169" \
@@ -216,7 +260,6 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "169,256" \
             --cache_stages "100,169" \
-            --enable_attn_cache --enable_mlp_cache \
             --adaptive_threshold \
             --calibrate --generate --benchmark
         ;;
@@ -226,7 +269,6 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "169,256" \
             --cache_stages "100,169" \
-            --enable_attn_cache --enable_mlp_cache \
             --calibrate \
             --similarity_data_path "$OUTPUT_DIR/similarity_data.pth"
         ;;
@@ -236,7 +278,6 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "169,256" \
             --cache_stages "100,169" \
-            --enable_attn_cache --enable_mlp_cache \
             --benchmark
         ;;
     
@@ -259,7 +300,6 @@ case $COMMAND in
         python var_evaluate_enhanced.py $COMMON_ARGS \
             --skip_stages "$CUSTOM_SKIP_STAGES" \
             --cache_stages "$CUSTOM_CACHE_STAGES" \
-            --enable_attn_cache --enable_mlp_cache \
             --generate --generate_fid
         ;;
     
