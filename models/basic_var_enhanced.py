@@ -239,8 +239,7 @@ class FFNEnhanced(nn.Module):
         # Check if we should skip computation and use cache
         if self.cache_config.should_skip_mlp(L) and cache_mlp[self.block_idx] is not None:
             if (L in length2iteration and 
-                length2iteration[L] - 1 >= 0 and 
-                cache_similarity_mlp[self.block_idx][length2iteration[L] - 1] > effective_threshold):
+                length2iteration[L] - 1 >= 0):
                 
                 result = feature_interpolate(
                     cache_mlp[self.block_idx],
@@ -258,8 +257,7 @@ class FFNEnhanced(nn.Module):
         # Check if we should cache the result
         if self.cache_config.should_cache_mlp(L):
             if (L in length2iteration and 
-                length2iteration[L] < len(cache_similarity_mlp[self.block_idx]) and
-                cache_similarity_mlp[self.block_idx][length2iteration[L]] > effective_threshold):
+                length2iteration[L] < len(cache_similarity_mlp[self.block_idx])):
                 
                 cache_mlp[self.block_idx] = result.clone()
         
@@ -418,8 +416,7 @@ class SelfAttentionEnhanced(nn.Module):
         # Check if we should skip computation and use cache
         if self.cache_config.should_skip_attn(L) and cache_attn[self.block_idx] is not None:
             if (L in length2iteration and 
-                length2iteration[L] - 1 >= 0 and 
-                cache_similarity_attn[self.block_idx][length2iteration[L] - 1] > effective_threshold):
+                length2iteration[L] - 1 >= 0):
                 
                 result = feature_interpolate(
                     cache_attn[self.block_idx],
@@ -437,8 +434,7 @@ class SelfAttentionEnhanced(nn.Module):
         # Check if we should cache the result
         if self.cache_config.should_cache_attn(L):
             if (L in length2iteration and 
-                length2iteration[L] < len(cache_similarity_attn[self.block_idx]) and
-                cache_similarity_attn[self.block_idx][length2iteration[L]] > effective_threshold):
+                length2iteration[L] < len(cache_similarity_attn[self.block_idx])):
                 
                 cache_attn[self.block_idx] = result.clone()
         

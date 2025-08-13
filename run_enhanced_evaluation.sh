@@ -10,8 +10,8 @@ MODEL_PATH=""
 VAE_PATH=""
 OUTPUT_DIR="./enhanced_var_output"
 DEVICE="cuda"
-BATCH_SIZE=16
-NUM_SAMPLES=100
+BATCH_SIZE=64
+NUM_SAMPLES=50
 
 # Print usage information
 print_usage() {
@@ -55,7 +55,7 @@ print_usage() {
 COMMAND=""
 CUSTOM_SKIP_STAGES=""
 CUSTOM_CACHE_STAGES=""
-THRESHOLD="1.0"
+THRESHOLD=0.0
 SAVE_IMAGES=""
 
 while [[ $# -gt 0 ]]; do
@@ -69,7 +69,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --output_dir)
-            OUTPUT_DIR="$2"
+            OUTPUT_DIR=$2
             shift 2
             ;;
         --device)
@@ -254,7 +254,7 @@ case $COMMAND in
             --skip_stages "$CUSTOM_SKIP_STAGES" \
             --cache_stages "$CUSTOM_CACHE_STAGES" \
             --enable_attn_cache --enable_mlp_cache \
-            --generate
+            --generate --generate_fid
         ;;
     
     *)

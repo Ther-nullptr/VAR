@@ -79,7 +79,7 @@ def build_vae_var_enhanced(
         cache_stages=cache_config.cache_stages if cache_config else [],
         enable_attn_cache=cache_config.enable_attn_cache if cache_config else True,
         enable_mlp_cache=cache_config.enable_mlp_cache if cache_config else True,
-        cache_threshold=cache_config.threshold if cache_config else 0.7,
+        cache_threshold=cache_config.threshold if cache_config else 0,
         max_skip_stages=cache_config.max_skip_stages if cache_config else 9,
         adaptive_threshold=cache_config.adaptive_threshold if cache_config else False,
         interpolation_mode=cache_config.interpolation_mode if cache_config else 'bilinear',
@@ -240,7 +240,7 @@ def run_cache_calibration(
             _ = var_model.autoregressive_infer_cfg(
                 B=current_batch_size,
                 label_B=labels,
-                g_seed=seed + batch_idx,
+                g_seed=seed,
                 cfg=cfg,
                 top_k=900,
                 top_p=0.96
@@ -299,7 +299,7 @@ def parse_args():
                         help='Enable MLP layer caching')
     parser.add_argument('--disable_mlp_cache', action='store_false', dest='enable_mlp_cache',
                         help='Disable MLP layer caching')
-    parser.add_argument('--cache_threshold', type=float, default=0.7,
+    parser.add_argument('--cache_threshold', type=float, default=0,
                         help='Similarity threshold for cache reuse')
     parser.add_argument('--max_skip_stages', type=int, default=9,
                         help='Maximum number of stages to skip')
@@ -379,7 +379,7 @@ def main():
             components.append("no_cache")
         
         # Cache threshold
-        if cache_config.threshold != 0.7:  # Only include if not default
+        if cache_config.threshold != 0.0:  # Only include if not default
             components.append(f"th{cache_config.threshold:.2f}")
         
         # Adaptive threshold
@@ -625,7 +625,7 @@ def main():
                         top_k=900, 
                         top_p=0.96, 
                         g_seed=args.seed, 
-                        more_smooth=args.more_smooth
+                        more_smooth=False
                     )
                 
                 if save_images:
@@ -662,6 +662,13 @@ def main():
             else:
                 print(f"FID statistics file not found: {args.fid_statistics_file}")
                 print("Skipping FID computation.")
+
+            for img_file in os.listdir(output_dir):
+                if img_file.endswith('.png'):
+                    # extract the sample index from the filename
+                    sample_index = int(img_file.split('_')[-1].split('.')[0])
+                    if sample_index % samples_per_class != 0:
+                        os.remove(osp.join(output_dir, img_file))
     
     # Save all results with parameter information
     if results:
