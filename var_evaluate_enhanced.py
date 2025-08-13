@@ -261,27 +261,27 @@ def run_cache_calibration(
 def parse_args():
     parser = argparse.ArgumentParser(description='Enhanced VAR model evaluation with configurable caching')
     
-    # Model configuration (matching original var_evaluate.py)
+    # Model configuration (matching bash script parameter names)
     parser.add_argument('--model-depth', type=int, default=16, choices=[16, 20, 24, 30], 
                        help='Model depth (16, 20, 24, or 30)')
-    parser.add_argument('--vae-ckpt', type=str, default='', 
+    parser.add_argument('--vae_path', type=str, default='', 
                        help='Path to VAE checkpoint')
-    parser.add_argument('--var-ckpt', type=str, default='', 
+    parser.add_argument('--model_path', type=str, default='', 
                        help='Path to VAR checkpoint')
     parser.add_argument('--device', type=str, default='cuda', 
                        help='Device to use (cuda/cpu)')
     
-    # Generation parameters (matching original var_evaluate.py) 
+    # Generation parameters (matching bash script parameter names) 
     parser.add_argument('--seed', type=int, default=1, help='Random seed')
     parser.add_argument('--cfg', type=float, default=1.5, 
                        help='Classifier-free guidance scale (1-10)')
     parser.add_argument('--more-smooth', action='store_true', 
                        help='Enable for smoother output')
-    parser.add_argument('--batch-size', type=int, default=64, 
+    parser.add_argument('--batch_size', type=int, default=64, 
                        help='Batch size for sampling')
-    parser.add_argument('--samples-per-class', type=int, default=50, 
+    parser.add_argument('--num_samples', type=int, default=50, 
                        help='Number of samples to generate per class')
-    parser.add_argument('--output-dir', type=str, default='./samples', 
+    parser.add_argument('--output_dir', type=str, default='./samples', 
                        help='Output directory for generated images')
     parser.add_argument('--tf32', action='store_true', 
                        help='Enable TF32 for faster computation')
@@ -316,8 +316,12 @@ def parse_args():
                         help='Run generation speed benchmark')
     parser.add_argument('--compare_configs', action='store_true',
                         help='Compare multiple cache configurations')
+    parser.add_argument('--generate', action='store_true',
+                        help='Generate samples (used by bash script)')
     parser.add_argument('--generate_fid', action='store_true',
                         help='Generate samples and compute FID (like original var_evaluate)')
+    parser.add_argument('--save_images', action='store_true',
+                        help='Save generated images')
     
     # FID computation arguments (matching original)
     parser.add_argument('--fid_statistics_file', type=str, 
@@ -354,16 +358,16 @@ def main():
     var_ckpt_dir = '/home/wyj24/models/VAR'  # Default path from original
     
     # Use provided paths or default ones
-    if args.vae_ckpt:
-        vae_ckpt = args.vae_ckpt
+    if args.vae_path:
+        vae_ckpt = args.vae_path
     else:
         vae_ckpt = f'{var_ckpt_dir}/vae_ch160v4096z32.pth'
         if not osp.exists(vae_ckpt): 
             print(f"Downloading VAE checkpoint...")
             os.system(f'wget {hf_home}/vae_ch160v4096z32.pth -O {vae_ckpt}')
     
-    if args.var_ckpt:
-        var_ckpt = args.var_ckpt
+    if args.model_path:
+        var_ckpt = args.model_path
     else:
         var_ckpt = f'{var_ckpt_dir}/var_d{args.model_depth}_new.pth'
         if not osp.exists(var_ckpt):
@@ -530,13 +534,13 @@ def main():
         var.set_cache_config(cache_config)
     
     # Generate samples and compute FID (matching original var_evaluate.py behavior)
-    if args.generate_fid:
+    if args.generate_fid or args.generate:
         print("\n" + "="*60)
         print("Generating Samples and Computing FID")
         print("="*60)
         
         B = args.batch_size
-        samples_per_class = args.samples_per_class
+        samples_per_class = args.num_samples
         iterations = (samples_per_class + B - 1) // B  # Ceiling division
         
         # Create output directory with cache config info
@@ -547,6 +551,9 @@ def main():
         
         print(f"Generating {samples_per_class} samples per class for 1000 classes...")
         print(f"Output directory: {output_dir}")
+        
+        # Only save images if requested or if computing FID
+        save_images = args.save_images or args.generate_fid
         
         for img_cls in tqdm(range(1000)):
             for i in range(iterations):
@@ -564,38 +571,40 @@ def main():
                         more_smooth=args.more_smooth
                     )
                 
-                bchw = recon_B3HW.permute(0, 2, 3, 1).mul_(255).cpu().numpy()
-                bchw = bchw.astype(np.uint8)
-                for j in range(current_batch):
-                    img = PImage.fromarray(bchw[j])
-                    img.save(osp.join(output_dir, f"sample_{img_cls * samples_per_class + i * B + j}.png"))
+                if save_images:
+                    bchw = recon_B3HW.permute(0, 2, 3, 1).mul_(255).cpu().numpy()
+                    bchw = bchw.astype(np.uint8)
+                    for j in range(current_batch):
+                        img = PImage.fromarray(bchw[j])
+                        img.save(osp.join(output_dir, f"sample_{img_cls * samples_per_class + i * B + j}.png"))
         
-        # compute FID (matching original)
-        print("Computing FID and Inception Score...")
-        if osp.exists(args.fid_statistics_file):
-            metrics_dict = torch_fidelity.calculate_metrics(
-                input1=output_dir,
-                input2=None,
-                fid_statistics_file=args.fid_statistics_file,
-                cuda=True,
-                isc=True,
-                fid=True,
-                kid=False,
-                prc=False,
-                verbose=False,
-            )
-            fid = metrics_dict['frechet_inception_distance']
-            inception_score = metrics_dict['inception_score_mean']
-            print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-            
-            results['fid_evaluation'] = {
-                'fid': float(fid),
-                'inception_score': float(inception_score),
-                'output_dir': output_dir
-            }
-        else:
-            print(f"FID statistics file not found: {args.fid_statistics_file}")
-            print("Skipping FID computation.")
+        # compute FID only if explicitly requested and images were saved
+        if args.generate_fid and save_images:
+            print("Computing FID and Inception Score...")
+            if osp.exists(args.fid_statistics_file):
+                metrics_dict = torch_fidelity.calculate_metrics(
+                    input1=output_dir,
+                    input2=None,
+                    fid_statistics_file=args.fid_statistics_file,
+                    cuda=True,
+                    isc=True,
+                    fid=True,
+                    kid=False,
+                    prc=False,
+                    verbose=False,
+                )
+                fid = metrics_dict['frechet_inception_distance']
+                inception_score = metrics_dict['inception_score_mean']
+                print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+                
+                results['fid_evaluation'] = {
+                    'fid': float(fid),
+                    'inception_score': float(inception_score),
+                    'output_dir': output_dir
+                }
+            else:
+                print(f"FID statistics file not found: {args.fid_statistics_file}")
+                print("Skipping FID computation.")
     
     # Save all results
     if results:
