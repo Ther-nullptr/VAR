@@ -167,32 +167,46 @@ class VAREnhanced(nn.Module, PyTorchModelHubMixin):
             print(f'[VAREnhanced] Adaptive threshold: {self.cache_config.adaptive_threshold}')
     
     def init_cache_similarity(self):
-        """Initialize cache similarity matrices"""
-        if not self.use_cache:
-            self.cache_similarity_attn = None
+        """Initialize cache similarity matrices (copied from original VAR)"""
+        if self.use_cache:
+            self.cache_mlp = [None for _ in range(self.depth)]
+            self.cache_attn = [None for _ in range(self.depth)]
+            
+            if self.calibration_mode:
+                self.cache_similarity_mlp = torch.zeros((self.depth, len(self.patch_nums)-1))
+                self.cache_similarity_attn = torch.zeros((self.depth, len(self.patch_nums)-1))
+                print('initial calibration for similarity')
+            else:
+                # Initialize with zeros, will be loaded from file if available
+                self.cache_similarity_mlp = torch.zeros((self.depth, len(self.patch_nums)-1))
+                self.cache_similarity_attn = torch.zeros((self.depth, len(self.patch_nums)-1))
+        else:
+            self.cache_mlp = None
+            self.cache_attn = None
             self.cache_similarity_mlp = None
-            return
-        
-        # Initialize similarity matrices for all blocks and stages
-        max_iterations = len(self.patch_nums)
-        self.cache_similarity_attn = [
-            [0.0] * max_iterations for _ in range(self.depth)
-        ]
-        self.cache_similarity_mlp = [
-            [0.0] * max_iterations for _ in range(self.depth)
-        ]
+            self.cache_similarity_attn = None
     
     def load_similarity_data(self, sim_path: str):
-        """Load pre-computed similarity data"""
+        """Load pre-computed similarity data (copied from original VAR)"""
+        if not self.use_cache:
+            return
+            
         try:
             data = torch.load(sim_path, map_location='cpu')
-            if 'cache_similarity_attn' in data:
-                self.cache_similarity_attn = data['cache_similarity_attn']
-            if 'cache_similarity_mlp' in data:
-                self.cache_similarity_mlp = data['cache_similarity_mlp']
-            print(f'[VAREnhanced] Loaded similarity data from {sim_path}')
+            self.cache_similarity_mlp = data['mlp']
+            self.cache_similarity_attn = data['attn']
+            print(f'load similarity data from {sim_path}')
+            
+            # compute the values that higher than threshold
+            threshold = self.cache_config.threshold
+            skip_index_mlp = self.cache_similarity_mlp > threshold
+            skip_index_attn = self.cache_similarity_attn > threshold
+            skip_ratio_mlp = (skip_index_mlp.sum()) / (self.cache_similarity_mlp.numel())
+            skip_ratio_attn = (skip_index_attn.sum()) / (self.cache_similarity_attn.numel())
+            print(f'cache similarity skip ratio: {skip_ratio_mlp:.2%} (threshold={threshold})')
+            print(f'cache similarity skip ratio: {skip_ratio_attn:.2%} (threshold={threshold})')
         except Exception as e:
-            print(f'[VAREnhanced] Failed to load similarity data from {sim_path}: {e}')
+            print(f'[VAREnhanced] Failed to load similarity data: {e}')
     
     def save_similarity_data(self, sim_path: str):
         """Save computed similarity data"""
