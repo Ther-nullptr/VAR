@@ -49,17 +49,20 @@ class VAREnhanced(nn.Module, PyTorchModelHubMixin):
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
         
         self.cond_drop_rate = cond_drop_rate
-        self.prog_si = -1   # progressive training
-
-        self.patch_nums: Tuple[int] = patch_nums
+        self.prog_si = -1
+        
+        # VAR specific attributes
+        self.patch_nums: Tuple = patch_nums
         self.L = sum(pn ** 2 for pn in self.patch_nums)
         self.first_l = self.patch_nums[0] ** 2
+        self.num_stages_minus_1 = len(self.patch_nums) - 1
+        
         self.begin_ends = []
         cur = 0
         for i, pn in enumerate(self.patch_nums):
             self.begin_ends.append((cur, cur+pn ** 2))
-            cur += pn ** 2
-        
+            cur += pn ** 2   # progressive training
+
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist.get_device())
         
@@ -318,82 +321,81 @@ class VAREnhanced(nn.Module, PyTorchModelHubMixin):
             
             return logits_BLV
     
-    @torch.inference_mode()
+    def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
+        """Copied from original VAR"""
+        if not isinstance(h_or_h_and_residual, torch.Tensor):
+            h, resi = h_or_h_and_residual   # fused_add_norm must be used
+            h = resi + self.blocks[-1].drop_path(h)
+        else:                               # fused_add_norm is not used
+            h = h_or_h_and_residual
+        return self.head(self.head_nm(h, cond_BD)).float()
+    
+    @torch.no_grad()
     def autoregressive_infer_cfg(
-        self, B: int, label_B: Optional[torch.Tensor], g_seed: Optional[int], 
-        cfg=1.5, top_k=0, top_p=0.96, more_smooth=False, **kwargs
-    ):
+        self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
+        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
+        more_smooth=False,
+    ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
-        Autoregressive inference with enhanced caching
+        Autoregressive inference copied from original VAR
         """
-        if g_seed is None: 
-            rng = None
-        else: 
-            self.rng.manual_seed(g_seed)
-            rng = self.rng
+        if g_seed is None: rng = None
+        else: self.rng.manual_seed(g_seed); rng = self.rng
         
-        # Initialize cache
-        if self.use_cache:
-            cache_attn = [None] * self.depth
-            cache_mlp = [None] * self.depth
-        else:
-            cache_attn = cache_mlp = None
-        
-        device = self.lvl_1L.device
         if label_B is None:
             label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
         elif isinstance(label_B, int):
-            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=device)
+            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
-        # Prepare conditioning
-        sos = cond_BD = self.class_emb(label_B).unsqueeze(1).expand(B, 1, self.D)
-        if not isinstance(self.shared_ada_lin, nn.Identity):
-            cond_BD = self.shared_ada_lin(cond_BD)
+        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         
-        # Autoregressive generation
-        lvl_pos = 0
+        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.L, self.Cvae, dtype=torch.float32)
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
-        for b, (begin, end) in enumerate(self.begin_ends):
-            if self.prog_si >= 0 and b > self.prog_si:
-                break
-            
-            cur_L += end - begin
-            
-            # Forward pass for current level
-            x_BLC = self.word_embed(f_hat[:, :cur_L].float())
-            x_BLC = x_BLC + self.pos_1LC[:, :cur_L] + self.lvl_embed.weight[:b+1].unsqueeze(0).expand_as(x_BLC)
-            
-            # Apply transformer blocks
-            for block in self.blocks:
-                x_BLC = block(
-                    x_BLC, cond_BD, None,  # attn_bias=None during inference
-                    cache_mlp, cache_attn,
-                    self.cache_similarity_mlp, self.cache_similarity_attn,
-                    calibration=False
+        for b in self.blocks: 
+            b.attn.kv_caching(True)
+        # self.patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13)
+        for si, pn in enumerate(self.patch_nums):   # si: i-th segment
+            ratio = si / self.num_stages_minus_1
+            # last_L = cur_L
+            cur_L += pn * pn
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            x = next_token_map
+            for b in self.blocks:
+                x = b(
+                    x=x, 
+                    cond_BD=cond_BD_or_gss, 
+                    attn_bias=None, 
+                    cache_similarity_attn=self.cache_similarity_attn, 
+                    cache_similarity_mlp=self.cache_similarity_mlp, 
+                    cache_mlp=self.cache_mlp, 
+                    cache_attn=self.cache_attn
                 )
+            logits_BlV = self.get_logits(x, cond_BD)
             
-            # Predict next tokens
-            x_BLC = self.head_nm(x_BLC, cond_BD)
-            logits_BLV = self.head(x_BLC)
+            t = cfg * ratio
+            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
             
-            # Sample tokens for current level
-            if b == self.num_stages_minus_1:
-                # Last stage
-                f_hat[:, begin:end] = self.vae_proxy[0].quantize.embedding.weight[
-                    sample_with_top_k_top_p_(logits_BLV[:, begin:end], rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-                ]
-            else:
-                # Intermediate stages
-                t = cfg * 2 if more_smooth else cfg
-                gumbel_hard_or_soft = True if more_smooth else False
-                f_hat[:, begin:end] = gumbel_softmax_with_rng(
-                    logits_BLV[:, begin:end].div(t), hard=gumbel_hard_or_soft, dim=-1, rng=rng
-                ) @ self.vae_proxy[0].quantize.embedding.weight.unsqueeze(0)
+            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            if not more_smooth: # this is the default case
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
+            else:   # not used when evaluating FID/IS/Precision/Recall
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
+                h_BChw = gumbel_softmax_with_rng(logits_BlV.div(gum_t), hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+            
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            if si != self.num_stages_minus_1:   # prepare for next stage
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                next_token_map = next_token_map.repeat(2, 1, 1)    # double the batch sizes due to CFG
         
-        # Decode to images
-        return self.vae_proxy[0].fhat_to_img(f_hat).add(1).div(2).clamp(0, 1)
+        for b in self.blocks: b.attn.kv_caching(False)
+        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         """Initialize model weights (copied from original VAR)"""
