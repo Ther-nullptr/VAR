@@ -383,6 +383,59 @@ class VAREnhanced(nn.Module, PyTorchModelHubMixin):
         
         # Decode to images
         return self.vae_proxy[0].fhat_to_img(f_hat).add(1).div(2).clamp(0, 1)
+    
+    def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
+        """Initialize model weights (copied from original VAR)"""
+        if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated
+        
+        print(f'[init_weights] {type(self).__name__} with {init_std=:g}')
+        for m in self.modules():
+            with_weight = hasattr(m, 'weight') and m.weight is not None
+            with_bias = hasattr(m, 'bias') and m.bias is not None
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight.data, std=init_std)
+                if with_bias: m.bias.data.zero_()
+            elif isinstance(m, nn.Embedding):
+                nn.init.trunc_normal_(m.weight.data, std=init_std)
+                if m.padding_idx is not None: m.weight.data[m.padding_idx].zero_()
+            elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm, nn.GroupNorm, nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
+                if with_weight: m.weight.data.fill_(1.)
+                if with_bias: m.bias.data.zero_()
+            # conv: VAR has no conv, only VQVAE has conv
+            elif isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d)):
+                if conv_std_or_gain > 0: nn.init.trunc_normal_(m.weight.data, std=conv_std_or_gain)
+                else: nn.init.xavier_normal_(m.weight.data, gain=-conv_std_or_gain)
+                if with_bias: m.bias.data.zero_()
+        
+        if init_head >= 0:
+            if isinstance(self.head, nn.Linear):
+                self.head.weight.data.mul_(init_head)
+                self.head.bias.data.zero_()
+            elif isinstance(self.head, nn.Sequential):
+                self.head[-1].weight.data.mul_(init_head)
+                self.head[-1].bias.data.zero_()
+        
+        if isinstance(self.head_nm, AdaLNBeforeHead):
+            self.head_nm.ada_lin[-1].weight.data.mul_(init_adaln)
+            if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
+                self.head_nm.ada_lin[-1].bias.data.zero_()
+        
+        depth = len(self.blocks)
+        for block_idx, sab in enumerate(self.blocks):
+            # sab: AdaLNSelfAttnEnhanced (enhanced version)
+            sab.attn.proj.weight.data.div_(math.sqrt(2 * depth))
+            sab.ffn.fc2.weight.data.div_(math.sqrt(2 * depth))
+            if hasattr(sab.ffn, 'fcg') and sab.ffn.fcg is not None:
+                nn.init.ones_(sab.ffn.fcg.bias)
+                nn.init.trunc_normal_(sab.ffn.fcg.weight, std=1e-5)
+            if hasattr(sab, 'ada_lin'):
+                sab.ada_lin[-1].weight.data[2*self.C:].mul_(init_adaln)
+                sab.ada_lin[-1].weight.data[:2*self.C].mul_(init_adaln_gamma)
+                if hasattr(sab.ada_lin[-1], 'bias') and sab.ada_lin[-1].bias is not None:
+                    sab.ada_lin[-1].bias.data.zero_()
+            elif hasattr(sab, 'ada_gss'):
+                sab.ada_gss.data[:, :, 2:].mul_(init_adaln)
+                sab.ada_gss.data[:, :, :2].mul_(init_adaln_gamma)
 
 
 # Factory function for easy model creation

@@ -349,8 +349,66 @@ def main():
     cache_config = create_cache_config_from_args(args)
     print_cache_config(cache_config)
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Generate descriptive output directory name with key parameters
+    def generate_output_dir_name(base_dir: str, args, cache_config: CacheConfig) -> str:
+        """Generate output directory name that includes key training parameters"""
+        components = []
+        
+        # Model configuration
+        components.append(f"d{args.model_depth}")
+        components.append(f"cfg{args.cfg}")
+        components.append(f"bs{args.batch_size}")
+        components.append(f"samples{args.num_samples}")
+        components.append(f"seed{args.seed}")
+        
+        # Cache configuration
+        if cache_config.skip_stages:
+            components.append(f"skip{'_'.join(map(str, cache_config.skip_stages))}")
+        if cache_config.cache_stages:
+            components.append(f"cache{'_'.join(map(str, cache_config.cache_stages))}")
+        
+        # Cache layer types
+        cache_layers = []
+        if cache_config.enable_attn_cache:
+            cache_layers.append("attn")
+        if cache_config.enable_mlp_cache:
+            cache_layers.append("mlp")
+        if cache_layers:
+            components.append(f"layers{'_'.join(cache_layers)}")
+        elif not cache_config.skip_stages:  # No caching at all
+            components.append("no_cache")
+        
+        # Cache threshold
+        if cache_config.threshold != 0.7:  # Only include if not default
+            components.append(f"th{cache_config.threshold:.2f}")
+        
+        # Adaptive threshold
+        if cache_config.adaptive_threshold:
+            components.append("adaptive")
+        
+        # Interpolation mode (only if not default)
+        if cache_config.interpolation_mode != 'bilinear':
+            components.append(f"interp{cache_config.interpolation_mode}")
+        
+        # TF32 flag
+        if args.tf32:
+            components.append("tf32")
+        
+        # More smooth flag
+        if args.more_smooth:
+            components.append("smooth")
+        
+        dir_name = "var_enhanced_" + "_".join(components)
+        return os.path.join(base_dir, dir_name)
+    
+    # Create base output directory and parameter-specific subdirectory
+    base_output_dir = args.output_dir
+    param_output_dir = generate_output_dir_name(base_output_dir, args, cache_config)
+    os.makedirs(param_output_dir, exist_ok=True)
+    
+    # Update args.output_dir to use the parameter-specific directory
+    args.output_dir = param_output_dir
+    print(f"Using parameter-specific output directory: {param_output_dir}")
     
     ################## 1. Download checkpoints and build models (matching original structure)
     # Set up checkpoint paths
@@ -543,9 +601,8 @@ def main():
         samples_per_class = args.num_samples
         iterations = (samples_per_class + B - 1) // B  # Ceiling division
         
-        # Create output directory with cache config info
-        cache_suffix = f"_skip{'_'.join(map(str, cache_config.skip_stages))}_cache{'_'.join(map(str, cache_config.cache_stages))}"
-        output_dir = f'var_d{args.model_depth}_cfg{args.cfg}_seed{args.seed}_enhanced{cache_suffix}'
+        # Use the parameter-specific output directory for sample generation
+        output_dir = os.path.join(args.output_dir, 'generated_samples')
         if not osp.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
         
@@ -606,12 +663,34 @@ def main():
                 print(f"FID statistics file not found: {args.fid_statistics_file}")
                 print("Skipping FID computation.")
     
-    # Save all results
+    # Save all results with parameter information
     if results:
+        # Add parameter info to results
+        results['parameters'] = {
+            'model_depth': args.model_depth,
+            'cfg': args.cfg,
+            'batch_size': args.batch_size,
+            'num_samples': args.num_samples,
+            'seed': args.seed,
+            'tf32': args.tf32,
+            'more_smooth': args.more_smooth,
+            'cache_config': {
+                'skip_stages': cache_config.skip_stages,
+                'cache_stages': cache_config.cache_stages,
+                'enable_attn_cache': cache_config.enable_attn_cache,
+                'enable_mlp_cache': cache_config.enable_mlp_cache,
+                'threshold': cache_config.threshold,
+                'adaptive_threshold': cache_config.adaptive_threshold,
+                'interpolation_mode': cache_config.interpolation_mode,
+                'max_skip_stages': cache_config.max_skip_stages
+            }
+        }
+        
         results_path = os.path.join(args.output_dir, 'enhanced_var_results.json')
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2, default=str)  # default=str to handle numpy types
         print(f"\nAll evaluation results saved to {results_path}")
+        print(f"Parameter-specific output directory: {args.output_dir}")
     
     print("\nEnhanced VAR evaluation completed!")
 
