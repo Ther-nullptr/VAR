@@ -55,17 +55,17 @@ print_usage() {
 COMMAND=""
 CUSTOM_SKIP_STAGES=""
 CUSTOM_CACHE_STAGES=""
-THRESHOLD="0.7"
+THRESHOLD="1.0"
 SAVE_IMAGES=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --model_path)
-            MODEL_PATH="$2"
+            MODEL_PATH=$2
             shift 2
             ;;
         --vae_path)
-            VAE_PATH="$2"
+            VAE_PATH=$2
             shift 2
             ;;
         --output_dir)
@@ -139,7 +139,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # Common arguments
-COMMON_ARGS="--model_path \"$MODEL_PATH\" --vae_path \"$VAE_PATH\" --output_dir \"$OUTPUT_DIR\" --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --cache_threshold $THRESHOLD $SAVE_IMAGES"
+COMMON_ARGS="--model_path $MODEL_PATH --vae_path $VAE_PATH --output_dir $OUTPUT_DIR --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --cache_threshold $THRESHOLD $SAVE_IMAGES"
 
 echo "=============================================="
 echo "Enhanced VAR Evaluation"
@@ -254,7 +254,7 @@ case $COMMAND in
             --skip_stages "$CUSTOM_SKIP_STAGES" \
             --cache_stages "$CUSTOM_CACHE_STAGES" \
             --enable_attn_cache --enable_mlp_cache \
-            --generate --benchmark
+            --generate
         ;;
     
     *)
