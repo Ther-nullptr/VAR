@@ -144,11 +144,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # Common arguments
-<<<<<<< HEAD
-COMMON_ARGS="--model_path $MODEL_PATH --vae_path $VAE_PATH --output_dir $OUTPUT_DIR --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --cache_threshold $THRESHOLD $SAVE_IMAGES"
-=======
-COMMON_ARGS="--model_path \"$MODEL_PATH\" --vae_path \"$VAE_PATH\" --output_dir \"$OUTPUT_DIR\" --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --model-depth $MODEL_DEPTH --cache_threshold $THRESHOLD $SAVE_IMAGES"
->>>>>>> a09394ca59f574e0d268dfc210684160aa4f35ce
+COMMON_ARGS="--model_path $MODEL_PATH --vae_path $VAE_PATH --output_dir $OUTPUT_DIR --device $DEVICE --batch_size $BATCH_SIZE --num_samples $NUM_SAMPLES --model-depth $MODEL_DEPTH --cache_threshold $THRESHOLD $SAVE_IMAGES"
 
 echo "=============================================="
 echo "Enhanced VAR Evaluation"
