@@ -1,25 +1,31 @@
 """
 Enhanced VAR evaluation script with flexible multi-stage caching control
+Compatible with original var_evaluate.py structure
 """
 
 import argparse
 import os
+import os.path as osp
 import sys
 import time
 from typing import List, Optional, Tuple
 import json
 
 import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torchvision.utils import save_image
+import torchvision
+import random
+from tqdm import tqdm
 import numpy as np
+import PIL.Image as PImage, PIL.ImageDraw as PImageDraw
 
-# Add model path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Disable default parameter init for faster speed
+setattr(torch.nn.Linear, 'reset_parameters', lambda self: None)
+setattr(torch.nn.LayerNorm, 'reset_parameters', lambda self: None)
 
-from models.var_enhanced import VAREnhanced, CacheConfig, create_var_enhanced_model
+# Import models using original structure
 from models.vqvae import VQVAE
+from models.basic_var_enhanced import CacheConfig
+import torch_fidelity
 
 
 def parse_list_arg(arg_str: str) -> List[int]:
@@ -27,6 +33,64 @@ def parse_list_arg(arg_str: str) -> List[int]:
     if not arg_str:
         return []
     return [int(x.strip()) for x in arg_str.split(',') if x.strip()]
+
+
+def build_vae_var_enhanced(
+    # Shared args
+    device, patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
+    # VQVAE args
+    V=4096, Cvae=32, ch=160, share_quant_resi=4,
+    # VAR args
+    num_classes=1000, depth=16, shared_aln=False, attn_l2_norm=True,
+    flash_if_available=True, fused_if_available=True,
+    init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=-1,    # init_std < 0: automated
+    # Enhanced caching args
+    cache_config: Optional[CacheConfig] = None,
+    calibration=False, sim_path=None
+) -> Tuple[VQVAE, 'VAREnhanced']:
+    """
+    Build VAE and enhanced VAR model with caching configuration
+    Compatible with original build_vae_var interface
+    """
+    from models.var_enhanced import VAREnhanced
+    
+    heads = depth
+    width = depth * 64
+    dpr = 0.1 * depth/24
+    
+    # disable built-in initialization for speed
+    for clz in (torch.nn.Linear, torch.nn.LayerNorm, torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.ConvTranspose1d, torch.nn.ConvTranspose2d):
+        setattr(clz, 'reset_parameters', lambda self: None)
+    
+    # build VQVAE
+    vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi, v_patch_nums=patch_nums).to(device)
+    
+    # build enhanced VAR
+    var_wo_ddp = VAREnhanced(
+        vae_local=vae_local,
+        num_classes=num_classes, depth=depth, embed_dim=width, num_heads=heads, 
+        drop_rate=0., attn_drop_rate=0., drop_path_rate=dpr,
+        norm_eps=1e-6, shared_aln=shared_aln, cond_drop_rate=0.1,
+        attn_l2_norm=attn_l2_norm,
+        patch_nums=patch_nums,
+        flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+        # Enhanced caching parameters
+        skip_stages=cache_config.skip_stages if cache_config else [],
+        cache_stages=cache_config.cache_stages if cache_config else [],
+        enable_attn_cache=cache_config.enable_attn_cache if cache_config else True,
+        enable_mlp_cache=cache_config.enable_mlp_cache if cache_config else True,
+        cache_threshold=cache_config.threshold if cache_config else 0.7,
+        max_skip_stages=cache_config.max_skip_stages if cache_config else 9,
+        adaptive_threshold=cache_config.adaptive_threshold if cache_config else False,
+        interpolation_mode=cache_config.interpolation_mode if cache_config else 'bilinear',
+        # Legacy compatibility
+        calibration=calibration, sim_path=sim_path
+    ).to(device)
+    
+    # Initialize weights
+    var_wo_ddp.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head, init_std=init_std)
+    
+    return vae_local, var_wo_ddp
 
 
 def create_cache_config_from_args(args) -> CacheConfig:
@@ -52,7 +116,6 @@ def validate_cache_stages(skip_stages: List[int], cache_stages: List[int]) -> bo
             print(f"Error: Invalid stage {stage}. Valid stages are: {valid_stages}")
             return False
     
-    # Check logical consistency
     if len(skip_stages) == 0 and len(cache_stages) > 0:
         print("Error: Cannot have cache stages without skip stages")
         return False
@@ -77,14 +140,16 @@ def print_cache_config(cache_config: CacheConfig):
 
 
 def benchmark_generation_speed(
-    model: VAREnhanced, 
+    var_model, 
     batch_size: int = 16, 
     num_classes: int = 1000,
     num_runs: int = 5,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    cfg: float = 1.5,
+    seed: int = 42
 ) -> dict:
     """Benchmark generation speed with current cache configuration"""
-    model.eval()
+    var_model.eval()
     torch.cuda.empty_cache()
     
     times = []
@@ -106,11 +171,11 @@ def benchmark_generation_speed(
             mem_before = torch.cuda.memory_allocated() / 1024**2  # MB
         
         with torch.no_grad():
-            generated_images = model.autoregressive_infer_cfg(
+            generated_images = var_model.autoregressive_infer_cfg(
                 B=batch_size,
                 label_B=labels,
-                g_seed=42 + run,
-                cfg=1.5,
+                g_seed=seed + run,
+                cfg=cfg,
                 top_k=900,
                 top_p=0.96
             )
@@ -151,17 +216,19 @@ def benchmark_generation_speed(
 
 
 def run_cache_calibration(
-    model: VAREnhanced,
+    var_model,
     batch_size: int = 16,
     num_classes: int = 1000,
     calibration_samples: int = 100,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    cfg: float = 1.5,
+    seed: int = 42
 ) -> dict:
     """Run cache calibration to compute similarity statistics"""
     print(f"Running cache calibration with {calibration_samples} samples...")
     
-    model.enable_calibration_mode(True)
-    model.eval()
+    var_model.enable_calibration_mode(True)
+    var_model.eval()
     
     num_batches = (calibration_samples + batch_size - 1) // batch_size
     
@@ -170,11 +237,11 @@ def run_cache_calibration(
         labels = torch.randint(0, num_classes, (current_batch_size,), device=device)
         
         with torch.no_grad():
-            _ = model.autoregressive_infer_cfg(
+            _ = var_model.autoregressive_infer_cfg(
                 B=current_batch_size,
                 label_B=labels,
-                g_seed=42 + batch_idx,
-                cfg=1.5,
+                g_seed=seed + batch_idx,
+                cfg=cfg,
                 top_k=900,
                 top_p=0.96
             )
@@ -182,34 +249,44 @@ def run_cache_calibration(
         if (batch_idx + 1) % 10 == 0:
             print(f"Calibration progress: {batch_idx + 1}/{num_batches} batches")
     
-    model.enable_calibration_mode(False)
+    var_model.enable_calibration_mode(False)
     
     # Get calibration statistics
-    stats = model.get_cache_statistics()
+    stats = var_model.get_cache_statistics()
     print("Calibration completed!")
     
     return stats
 
 
-def save_results(results: dict, output_path: str):
-    """Save benchmark results to JSON file"""
-    with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"Results saved to {output_path}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Enhanced VAR Evaluation with Flexible Caching')
+def parse_args():
+    parser = argparse.ArgumentParser(description='Enhanced VAR model evaluation with configurable caching')
     
-    # Model arguments
-    parser.add_argument('--model_path', type=str, required=True,
-                        help='Path to VAR model checkpoint')
-    parser.add_argument('--vae_path', type=str, required=True,
-                        help='Path to VAE checkpoint')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use (cuda/cpu)')
+    # Model configuration (matching original var_evaluate.py)
+    parser.add_argument('--model-depth', type=int, default=16, choices=[16, 20, 24, 30], 
+                       help='Model depth (16, 20, 24, or 30)')
+    parser.add_argument('--vae-ckpt', type=str, default='', 
+                       help='Path to VAE checkpoint')
+    parser.add_argument('--var-ckpt', type=str, default='', 
+                       help='Path to VAR checkpoint')
+    parser.add_argument('--device', type=str, default='cuda', 
+                       help='Device to use (cuda/cpu)')
     
-    # Cache configuration arguments
+    # Generation parameters (matching original var_evaluate.py) 
+    parser.add_argument('--seed', type=int, default=1, help='Random seed')
+    parser.add_argument('--cfg', type=float, default=1.5, 
+                       help='Classifier-free guidance scale (1-10)')
+    parser.add_argument('--more-smooth', action='store_true', 
+                       help='Enable for smoother output')
+    parser.add_argument('--batch-size', type=int, default=64, 
+                       help='Batch size for sampling')
+    parser.add_argument('--samples-per-class', type=int, default=50, 
+                       help='Number of samples to generate per class')
+    parser.add_argument('--output-dir', type=str, default='./samples', 
+                       help='Output directory for generated images')
+    parser.add_argument('--tf32', action='store_true', 
+                       help='Enable TF32 for faster computation')
+    
+    # Enhanced cache configuration arguments
     parser.add_argument('--skip_stages', type=str, default='',
                         help='Comma-separated list of stages to skip (e.g., "169,256")')
     parser.add_argument('--cache_stages', type=str, default='',
@@ -232,42 +309,30 @@ def main():
                         choices=['bilinear', 'nearest', 'bicubic'],
                         help='Interpolation mode for feature upsampling')
     
-    # Evaluation arguments
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='Batch size for evaluation')
-    parser.add_argument('--num_samples', type=int, default=100,
-                        help='Number of samples to generate')
-    parser.add_argument('--num_classes', type=int, default=1000,
-                        help='Number of classes')
-    parser.add_argument('--cfg_scale', type=float, default=1.5,
-                        help='Classifier-free guidance scale')
-    parser.add_argument('--top_k', type=int, default=900,
-                        help='Top-k sampling')
-    parser.add_argument('--top_p', type=float, default=0.96,
-                        help='Top-p (nucleus) sampling')
-    
     # Operation modes
     parser.add_argument('--calibrate', action='store_true',
                         help='Run cache calibration')
     parser.add_argument('--benchmark', action='store_true',
                         help='Run generation speed benchmark')
-    parser.add_argument('--generate', action='store_true',
-                        help='Generate sample images')
     parser.add_argument('--compare_configs', action='store_true',
                         help='Compare multiple cache configurations')
+    parser.add_argument('--generate_fid', action='store_true',
+                        help='Generate samples and compute FID (like original var_evaluate)')
     
-    # Output arguments
-    parser.add_argument('--output_dir', type=str, default='./enhanced_var_output',
-                        help='Output directory for generated images and results')
-    parser.add_argument('--save_images', action='store_true',
-                        help='Save generated images')
+    # FID computation arguments (matching original)
+    parser.add_argument('--fid_statistics_file', type=str, 
+                        default='/home/wyj24/project/lpd/fid_stats/adm_in256_stats.npz',
+                        help='Path to FID statistics file')
+    
+    # Similarity data management
     parser.add_argument('--similarity_data_path', type=str, default='',
                         help='Path to save/load similarity calibration data')
     
-    args = parser.parse_args()
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     
     # Validate cache configuration
     skip_stages = parse_list_arg(args.skip_stages)
@@ -280,27 +345,79 @@ def main():
     cache_config = create_cache_config_from_args(args)
     print_cache_config(cache_config)
     
-    # Load models
-    print("Loading models...")
-    device = torch.device(args.device)
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load VAE
-    vae_model = VQVAE.from_pretrained(args.vae_path)
-    vae_model.to(device)
-    vae_model.eval()
+    ################## 1. Download checkpoints and build models (matching original structure)
+    # Set up checkpoint paths
+    hf_home = 'https://huggingface.co/FoundationVision/var/resolve/main'
+    var_ckpt_dir = '/home/wyj24/models/VAR'  # Default path from original
     
-    # Load VAR model with enhanced caching
-    var_model = VAREnhanced.from_pretrained(args.model_path)
-    var_model.set_cache_config(cache_config)
-    var_model.to(device)
-    var_model.eval()
+    # Use provided paths or default ones
+    if args.vae_ckpt:
+        vae_ckpt = args.vae_ckpt
+    else:
+        vae_ckpt = f'{var_ckpt_dir}/vae_ch160v4096z32.pth'
+        if not osp.exists(vae_ckpt): 
+            print(f"Downloading VAE checkpoint...")
+            os.system(f'wget {hf_home}/vae_ch160v4096z32.pth -O {vae_ckpt}')
+    
+    if args.var_ckpt:
+        var_ckpt = args.var_ckpt
+    else:
+        var_ckpt = f'{var_ckpt_dir}/var_d{args.model_depth}_new.pth'
+        if not osp.exists(var_ckpt):
+            print(f"Downloading VAR checkpoint...")
+            os.system(f'wget {hf_home}/var_d{args.model_depth}_new.pth -O {var_ckpt}')
+    
+    # build vae, var (using original structure but with enhancements)
+    patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    device = args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu'
+    
+    print("Building enhanced VAR model...")
+    vae, var = build_vae_var_enhanced(
+        V=4096, Cvae=32, ch=160, share_quant_resi=4,    # hard-coded VQVAE hyperparameters
+        device=device, patch_nums=patch_nums,
+        num_classes=1000, depth=args.model_depth, shared_aln=False,
+        cache_config=cache_config,
+        calibration=args.calibrate,
+        sim_path=args.similarity_data_path if args.similarity_data_path else None,
+    )
+    
+    # load checkpoints (original style)
+    print("Loading model checkpoints...")
+    vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
+    var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
+    vae.eval(), var.eval()
+    for p in vae.parameters(): p.requires_grad_(False)
+    for p in var.parameters(): p.requires_grad_(False)
+    print(f'Model preparation finished.')
     
     # Load similarity data if provided
     if args.similarity_data_path and os.path.exists(args.similarity_data_path):
-        var_model.load_similarity_data(args.similarity_data_path)
+        var.load_similarity_data(args.similarity_data_path)
+        print(f"Loaded similarity data from {args.similarity_data_path}")
     
-    print(f"Model loaded. Using device: {device}")
-    print(f"Model parameters: {sum(p.numel() for p in var_model.parameters()):,}")
+    ############################# 2. Run evaluation modes
+    
+    # seed (matching original)
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Enable TF32 if requested
+    if args.tf32:
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+    
+    # Convert to float16 for efficiency (matching original)
+    vae, var = vae.to(torch.float16), var.to(torch.float16)
+    
+    print(f"Model loaded on {device}. Using dtype: {next(var.parameters()).dtype}")
+    print(f"Model parameters: {sum(p.numel() for p in var.parameters()):,}")
     
     results = {}
     
@@ -310,17 +427,18 @@ def main():
         print("Running Cache Calibration")
         print("="*60)
         calibration_stats = run_cache_calibration(
-            var_model, 
-            batch_size=args.batch_size,
-            num_classes=args.num_classes,
-            calibration_samples=args.num_samples,
-            device=args.device
+            var, 
+            batch_size=min(args.batch_size, 16),  # Smaller batch for calibration
+            calibration_samples=100,
+            device=device,
+            cfg=args.cfg,
+            seed=args.seed
         )
         results['calibration'] = calibration_stats
         
         # Save calibration data
         if args.similarity_data_path:
-            var_model.save_similarity_data(args.similarity_data_path)
+            var.save_similarity_data(args.similarity_data_path)
     
     # Run benchmark
     if args.benchmark:
@@ -328,45 +446,13 @@ def main():
         print("Running Speed Benchmark")
         print("="*60)
         benchmark_stats = benchmark_generation_speed(
-            var_model,
-            batch_size=args.batch_size,
-            num_classes=args.num_classes,
-            device=args.device
+            var,
+            batch_size=min(args.batch_size, 16),  # Reasonable batch size for benchmarking
+            device=device,
+            cfg=args.cfg,
+            seed=args.seed
         )
         results['benchmark'] = benchmark_stats
-    
-    # Generate samples
-    if args.generate:
-        print("\n" + "="*60)
-        print("Generating Sample Images")
-        print("="*60)
-        
-        num_batches = (args.num_samples + args.batch_size - 1) // args.batch_size
-        all_images = []
-        
-        for batch_idx in range(num_batches):
-            current_batch_size = min(args.batch_size, args.num_samples - batch_idx * args.batch_size)
-            labels = torch.randint(0, args.num_classes, (current_batch_size,), device=device)
-            
-            with torch.no_grad():
-                images = var_model.autoregressive_infer_cfg(
-                    B=current_batch_size,
-                    label_B=labels,
-                    g_seed=42 + batch_idx,
-                    cfg=args.cfg_scale,
-                    top_k=args.top_k,
-                    top_p=args.top_p
-                )
-            
-            all_images.append(images.cpu())
-            print(f"Generated batch {batch_idx + 1}/{num_batches}")
-        
-        # Save images
-        if args.save_images:
-            all_images = torch.cat(all_images, dim=0)
-            save_path = os.path.join(args.output_dir, 'generated_samples.png')
-            save_image(all_images, save_path, nrow=8, normalize=True)
-            print(f"Saved {len(all_images)} images to {save_path}")
     
     # Compare configurations
     if args.compare_configs:
@@ -379,9 +465,9 @@ def main():
             CacheConfig(skip_stages=[], cache_stages=[]),
             # Original VAR caching
             CacheConfig(skip_stages=[169, 256], cache_stages=[100, 169]),
-            # Conservative caching (fewer skips)
+            # Conservative caching
             CacheConfig(skip_stages=[256], cache_stages=[169]),
-            # Aggressive caching (more skips)
+            # Aggressive caching
             CacheConfig(skip_stages=[100, 169, 256], cache_stages=[64, 100, 169]),
             # MLP-only caching
             CacheConfig(skip_stages=[169, 256], cache_stages=[100, 169], 
@@ -402,15 +488,16 @@ def main():
             print(f"Skip stages: {config.skip_stages}, Cache stages: {config.cache_stages}")
             print(f"Attention cache: {config.enable_attn_cache}, MLP cache: {config.enable_mlp_cache}")
             
-            var_model.set_cache_config(config)
+            var.set_cache_config(config)
             
             # Run benchmark for this configuration
             stats = benchmark_generation_speed(
-                var_model, 
-                batch_size=args.batch_size//2,  # Smaller batch for comparison
-                num_classes=args.num_classes,
+                var, 
+                batch_size=min(args.batch_size//2, 8),  # Smaller batch for comparison
                 num_runs=3,  # Fewer runs for comparison
-                device=args.device
+                device=device,
+                cfg=args.cfg,
+                seed=args.seed
             )
             
             comparison_results[name] = {
@@ -438,11 +525,84 @@ def main():
             speedup = baseline_time / perf['mean_time']
             print(f"{name:<12} {perf['mean_time']:<10.2f} {speedup:<8.2f} "
                   f"{perf['mean_memory_mb']:<12.1f} {perf['throughput_img_per_sec']:<15.2f}")
+        
+        # Restore original cache config
+        var.set_cache_config(cache_config)
+    
+    # Generate samples and compute FID (matching original var_evaluate.py behavior)
+    if args.generate_fid:
+        print("\n" + "="*60)
+        print("Generating Samples and Computing FID")
+        print("="*60)
+        
+        B = args.batch_size
+        samples_per_class = args.samples_per_class
+        iterations = (samples_per_class + B - 1) // B  # Ceiling division
+        
+        # Create output directory with cache config info
+        cache_suffix = f"_skip{'_'.join(map(str, cache_config.skip_stages))}_cache{'_'.join(map(str, cache_config.cache_stages))}"
+        output_dir = f'var_d{args.model_depth}_cfg{args.cfg}_seed{args.seed}_enhanced{cache_suffix}'
+        if not osp.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"Generating {samples_per_class} samples per class for 1000 classes...")
+        print(f"Output directory: {output_dir}")
+        
+        for img_cls in tqdm(range(1000)):
+            for i in range(iterations):
+                current_batch = min(B, samples_per_class - i * B)
+                label_B = torch.tensor([img_cls] * current_batch, device=device)
+                
+                with torch.no_grad():
+                    recon_B3HW = var.autoregressive_infer_cfg(
+                        B=current_batch, 
+                        label_B=label_B, 
+                        cfg=args.cfg, 
+                        top_k=900, 
+                        top_p=0.96, 
+                        g_seed=args.seed, 
+                        more_smooth=args.more_smooth
+                    )
+                
+                bchw = recon_B3HW.permute(0, 2, 3, 1).mul_(255).cpu().numpy()
+                bchw = bchw.astype(np.uint8)
+                for j in range(current_batch):
+                    img = PImage.fromarray(bchw[j])
+                    img.save(osp.join(output_dir, f"sample_{img_cls * samples_per_class + i * B + j}.png"))
+        
+        # compute FID (matching original)
+        print("Computing FID and Inception Score...")
+        if osp.exists(args.fid_statistics_file):
+            metrics_dict = torch_fidelity.calculate_metrics(
+                input1=output_dir,
+                input2=None,
+                fid_statistics_file=args.fid_statistics_file,
+                cuda=True,
+                isc=True,
+                fid=True,
+                kid=False,
+                prc=False,
+                verbose=False,
+            )
+            fid = metrics_dict['frechet_inception_distance']
+            inception_score = metrics_dict['inception_score_mean']
+            print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+            
+            results['fid_evaluation'] = {
+                'fid': float(fid),
+                'inception_score': float(inception_score),
+                'output_dir': output_dir
+            }
+        else:
+            print(f"FID statistics file not found: {args.fid_statistics_file}")
+            print("Skipping FID computation.")
     
     # Save all results
     if results:
         results_path = os.path.join(args.output_dir, 'enhanced_var_results.json')
-        save_results(results, results_path)
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2, default=str)  # default=str to handle numpy types
+        print(f"\nAll evaluation results saved to {results_path}")
     
     print("\nEnhanced VAR evaluation completed!")
 
