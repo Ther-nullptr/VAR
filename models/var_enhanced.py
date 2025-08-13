@@ -134,11 +134,20 @@ class VAREnhanced(nn.Module, PyTorchModelHubMixin):
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
         
-        # 5. output head
-        self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer)
-        self.head = nn.Linear(self.C, self.V, bias=False)
+        # 5. attention mask used in training (for masking out the future)
+        #    it won't be used in inference, since kv cache is enabled
+        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
+        dT = d.transpose(1, 2)    # dT: 11L
+        lvl_1L = dT[:, 0].contiguous()
+        self.register_buffer('lvl_1L', lvl_1L)
+        attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
+        self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
-        # 6. initialize cache similarity matrices
+        # 6. classifier head
+        self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
+        self.head = nn.Linear(self.C, self.V)  # bias=True by default
+        
+        # 7. initialize cache similarity matrices
         self.init_cache_similarity()
         
         # Load similarity data if provided
@@ -330,9 +339,11 @@ class VAREnhanced(nn.Module, PyTorchModelHubMixin):
         else:
             cache_attn = cache_mlp = None
         
-        device = next(self.parameters()).device
+        device = self.lvl_1L.device
         if label_B is None:
-            label_B = torch.multinomial(self.uniform_prob.expand(B, -1), num_samples=1, generator=rng).view(B)
+            label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
+        elif isinstance(label_B, int):
+            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=device)
         
         # Prepare conditioning
         sos = cond_BD = self.class_emb(label_B).unsqueeze(1).expand(B, 1, self.D)
