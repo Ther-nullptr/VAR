@@ -20,7 +20,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.var_enhanced import VAREnhanced, CacheConfig, create_var_enhanced_model
 from models.vqvae import VQVAE
-from utils.arg_util import arg_util
 
 
 def parse_list_arg(arg_str: str) -> List[int]:
