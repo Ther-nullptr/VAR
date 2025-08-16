@@ -19,7 +19,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models.var_layer_cache_control import VARLayerCacheControl, parse_layer_cache_spec, parse_layer_set_spec, parse_layer_blend_spec
 from models.basic_var_layer_control import LayerCacheConfig
-from models.vqvae import VQVAE
+from models import VQVAE, build_vae_var
 import dist
 
 
@@ -41,6 +41,8 @@ def main():
     # Basic model arguments
     parser.add_argument('--model_path', type=str, required=True, help='path to var checkpoint')
     parser.add_argument('--vae_path', type=str, required=True, help='path to vae checkpoint')
+    parser.add_argument('--model_depth', type=int, default=16, choices=[16, 20, 24, 30], 
+                       help='Model depth (16, 20, 24, or 30)')
     parser.add_argument('--num_samples', type=int, default=50000, help='number of samples to generate')
     parser.add_argument('--batch_size', type=int, default=100, help='batch size for generation')
     parser.add_argument('--class_num', type=int, default=1000, help='number of classes')
@@ -114,8 +116,13 @@ def main():
     if args.cache_stages:
         cache_stages = [int(x.strip()) for x in args.cache_stages.split(',') if x.strip()]
     
+    # Determine patch_nums based on model architecture
+    patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    
     # Create layer cache configuration
     layer_cache_config = LayerCacheConfig(
+        model_depth=args.model_depth,
+        num_stages=len(patch_nums),
         skip_stages=skip_stages,
         cache_stages=cache_stages,
         enable_attn_cache=args.enable_attn_cache,
@@ -130,7 +137,7 @@ def main():
         layer_blend_ratios=layer_blend_ratios
     )
     
-    print(f"Layer cache configuration: {layer_cache_config.get_cache_summary(10, 16)}")
+    print(f"Layer cache configuration: {layer_cache_config.get_cache_summary()}")
     
     # Create output directory with detailed naming
     cache_desc = []
@@ -144,22 +151,35 @@ def main():
         cache_desc.append("blend")
     
     cache_suffix = "_" + "_".join(cache_desc) if cache_desc else ""
-    output_dir = f"{args.output_dir}_cfg{args.cfg}_topk{args.top_k}_topp{args.top_p}_temp{args.temperature}{cache_suffix}"
+    output_dir = f"{args.output_dir}_d{args.model_depth}_cfg{args.cfg}_topk{args.top_k}_topp{args.top_p}_temp{args.temperature}{cache_suffix}"
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
     print(f"Output directory: {output_path}")
     
-    # Load VAE
-    print("Loading VAE...")
-    vae = VQVAE.from_pretrained(args.vae_path).to(device)
-    vae.eval()
+    # Build VAE and VAR models
+    print("Building VAE and VAR models...")
+    vae, var_base = build_vae_var(
+        V=4096, Cvae=32, ch=160, share_quant_resi=4,    # hard-coded VQVAE hyperparameters
+        device=device, patch_nums=patch_nums,
+        num_classes=args.class_num, depth=args.model_depth, shared_aln=False,
+    )
     
-    # Load VAR model with fine-grained layer cache control
-    print("Loading VAR model...")
+    # Load checkpoints
+    print(f"Loading VAE checkpoint from {args.vae_path}")
+    vae.load_state_dict(torch.load(args.vae_path, map_location='cpu'), strict=True)
+    vae.eval()
+    for p in vae.parameters(): 
+        p.requires_grad_(False)
+    
+    # Create VAR model with fine-grained layer cache control
+    print("Creating VAR model with fine-grained layer cache control...")
     var_model = VARLayerCacheControl(
         vae_local=vae,
-        layer_cache_config=layer_cache_config
+        layer_cache_config=layer_cache_config,
+        num_classes=args.class_num,
+        depth=args.model_depth,
+        patch_nums=patch_nums
     ).to(device)
     
     # Load checkpoint
@@ -272,7 +292,7 @@ def main():
                 f.write(f"FID Score: {fid_value:.4f}\n")
                 f.write(f"Real images: {args.real_img_dir}\n")
                 f.write(f"Generated images: {len(all_images)}\n")
-                f.write(f"Cache config: {layer_cache_config.get_cache_summary(10, 16)}\n")
+                f.write(f"Cache config: {layer_cache_config.get_cache_summary()}\n")
             
             # Clean up temporary directory
             import shutil
@@ -293,7 +313,7 @@ def main():
         'temperature': args.temperature,
         'seed': args.seed,
         'more_smooth': args.more_smooth,
-        'layer_cache_config': layer_cache_config.get_cache_summary(10, 16),
+        'layer_cache_config': layer_cache_config.get_cache_summary(),
         'generation_time': generation_time,
         'avg_time_per_image': generation_time / args.num_samples
     }
@@ -304,7 +324,7 @@ def main():
     
     print(f"Generation completed successfully!")
     print(f"Images saved to: {output_path}")
-    print(f"Fine-grained cache configuration: {layer_cache_config.get_cache_summary(10, 16)}")
+    print(f"Fine-grained cache configuration: {layer_cache_config.get_cache_summary()}")
 
 
 if __name__ == '__main__':

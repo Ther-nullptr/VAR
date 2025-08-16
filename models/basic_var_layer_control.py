@@ -80,6 +80,10 @@ class LayerCacheConfig:
     """
     def __init__(
         self,
+        # Model architecture parameters
+        model_depth: int = 16,           # Number of transformer layers (16, 20, 24, 30)
+        num_stages: int = 10,            # Number of generation stages (0-9)
+        
         # Original stage-based controls
         skip_stages: List[int] = None,  # List of stages to skip (e.g., [169, 256])
         cache_stages: List[int] = None,  # List of stages to cache (e.g., [100, 169])
@@ -98,13 +102,21 @@ class LayerCacheConfig:
         layer_interpolation_modes: Dict[Tuple[int, int], str] = None,  # {(stage_idx, layer_idx): mode}
         layer_blend_ratios: Dict[Tuple[int, int], float] = None,       # {(stage_idx, layer_idx): blend_ratio}
     ):
+        # Model architecture parameters
+        self.model_depth = model_depth
+        self.num_stages = num_stages
+        
+        # Validate model depth
+        if model_depth not in {16, 20, 24, 30}:
+            raise ValueError(f"Unsupported model depth {model_depth}. Must be one of [16, 20, 24, 30]")
+        
         # Original configuration
         self.skip_stages = skip_stages or []
         self.cache_stages = cache_stages or []
         self.enable_attn_cache = enable_attn_cache
         self.enable_mlp_cache = enable_mlp_cache
         self.threshold = threshold
-        self.max_skip_stages = min(max_skip_stages, 9)
+        self.max_skip_stages = min(max_skip_stages, num_stages - 1)
         self.adaptive_threshold = adaptive_threshold
         self.interpolation_mode = interpolation_mode
         
@@ -130,8 +142,35 @@ class LayerCacheConfig:
             if stage not in valid_lengths:
                 raise ValueError(f"Invalid stage {stage}. Must be one of {sorted(valid_lengths)}")
         
+        # Validate layer indices for fine-grained control
+        for stage_idx, layer_control in self.stage_layer_cache_control.items():
+            if not 0 <= stage_idx < self.num_stages:
+                raise ValueError(f"Invalid stage index {stage_idx}. Must be in [0, {self.num_stages-1}]")
+            for layer_idx in layer_control.keys():
+                if not 0 <= layer_idx < self.model_depth:
+                    raise ValueError(f"Invalid layer index {layer_idx} for model depth {self.model_depth}. Must be in [0, {self.model_depth-1}]")
+        
+        # Validate cache layer indices
+        for stage_idx, layer_set in self.cache_attn_layers.items():
+            if not 0 <= stage_idx < self.num_stages:
+                raise ValueError(f"Invalid stage index {stage_idx}. Must be in [0, {self.num_stages-1}]")
+            for layer_idx in layer_set:
+                if not 0 <= layer_idx < self.model_depth:
+                    raise ValueError(f"Invalid layer index {layer_idx} for model depth {self.model_depth}. Must be in [0, {self.model_depth-1}]")
+        
+        for stage_idx, layer_set in self.cache_mlp_layers.items():
+            if not 0 <= stage_idx < self.num_stages:
+                raise ValueError(f"Invalid stage index {stage_idx}. Must be in [0, {self.num_stages-1}]")
+            for layer_idx in layer_set:
+                if not 0 <= layer_idx < self.model_depth:
+                    raise ValueError(f"Invalid layer index {layer_idx} for model depth {self.model_depth}. Must be in [0, {self.model_depth-1}]")
+        
         # Validate layer blend ratios
         for (stage_idx, layer_idx), ratio in self.layer_blend_ratios.items():
+            if not 0 <= stage_idx < self.num_stages:
+                raise ValueError(f"Invalid stage index {stage_idx}. Must be in [0, {self.num_stages-1}]")
+            if not 0 <= layer_idx < self.model_depth:
+                raise ValueError(f"Invalid layer index {layer_idx} for model depth {self.model_depth}. Must be in [0, {self.model_depth-1}]")
             if not 0.0 <= ratio <= 1.0:
                 raise ValueError(f"Blend ratio for stage {stage_idx} layer {layer_idx} must be in [0, 1]")
     
@@ -187,9 +226,18 @@ class LayerCacheConfig:
         """Get blend ratio for specific stage and layer (1.0 = pure cache, 0.0 = pure computation)"""
         return self.layer_blend_ratios.get((stage_idx, layer_idx), 1.0)  # Default to pure cache
     
-    def get_cache_summary(self, num_stages: int, num_layers: int) -> str:
+    def get_cache_summary(self, num_stages: int = None, num_layers: int = None) -> str:
         """Get a summary string of the cache configuration"""
+        # Use configured values if not provided
+        if num_stages is None:
+            num_stages = self.num_stages
+        if num_layers is None:
+            num_layers = self.model_depth
+            
         summary_parts = []
+        
+        # Model architecture summary
+        summary_parts.append(f"Model: depth={self.model_depth}, stages={self.num_stages}")
         
         # Stage-based summary
         if self.skip_stages or self.cache_stages:

@@ -8,6 +8,7 @@ set -e  # Exit on any error
 # Default configuration
 MODEL_PATH=""
 VAE_PATH=""
+MODEL_DEPTH=16
 NUM_SAMPLES=50000
 BATCH_SIZE=100
 CLASS_NUM=1000
@@ -58,6 +59,9 @@ Usage: $0 [OPTIONS]
 Required Arguments:
   --model_path PATH         Path to VAR checkpoint
   --vae_path PATH          Path to VAE checkpoint
+
+Model Architecture Arguments:
+  --model_depth N          Model depth: 16, 20, 24, or 30 (default: 16)
 
 Basic Generation Arguments:
   --num_samples N          Number of samples to generate (default: 50000)
@@ -164,6 +168,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --vae_path)
             VAE_PATH="$2"
+            shift 2
+            ;;
+        --model_depth)
+            MODEL_DEPTH="$2"
             shift 2
             ;;
         --num_samples)
@@ -335,6 +343,7 @@ echo "VAR Fine-Grained Layer Cache Control"
 echo "============================================"
 echo "Model path: $MODEL_PATH"
 echo "VAE path: $VAE_PATH"
+echo "Model depth: $MODEL_DEPTH"
 echo "Number of samples: $NUM_SAMPLES"
 echo "Batch size: $BATCH_SIZE"
 echo "CFG scale: $CFG"
@@ -370,6 +379,7 @@ echo "============================================"
 PYTHON_CMD="python var_evaluate_layer_cache_control.py"
 PYTHON_CMD="$PYTHON_CMD --model_path $MODEL_PATH"
 PYTHON_CMD="$PYTHON_CMD --vae_path $VAE_PATH"
+PYTHON_CMD="$PYTHON_CMD --model_depth $MODEL_DEPTH"
 PYTHON_CMD="$PYTHON_CMD --num_samples $NUM_SAMPLES"
 PYTHON_CMD="$PYTHON_CMD --batch_size $BATCH_SIZE"
 PYTHON_CMD="$PYTHON_CMD --class_num $CLASS_NUM"

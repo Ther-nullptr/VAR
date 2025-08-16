@@ -141,7 +141,7 @@ def test_layer_cache_config():
     print("✓ Layer blend ratio logic passed")
     
     # Test cache summary
-    summary = config.get_cache_summary(10, 16)
+    summary = config.get_cache_summary()
     print(f"✓ Cache summary: {summary}")
 
 
@@ -176,7 +176,7 @@ def test_integration():
         layer_blend_ratios=layer_blend_ratios
     )
     
-    print(f"✓ Integration test complete. Config summary: {config.get_cache_summary(10, 16)}")
+    print(f"✓ Integration test complete. Config summary: {config.get_cache_summary()}")
 
 
 def main():

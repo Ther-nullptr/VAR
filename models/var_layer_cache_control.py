@@ -174,7 +174,23 @@ class VARLayerCacheControl(nn.Module, PyTorchModelHubMixin):
         self.rng = torch.Generator(device=dist.get_device())
         
         # Fine-grained layer cache configuration
-        self.layer_cache_config = layer_cache_config or LayerCacheConfig()
+        if layer_cache_config is None:
+            layer_cache_config = LayerCacheConfig(
+                model_depth=depth,
+                num_stages=len(patch_nums)
+            )
+        else:
+            # Ensure layer cache config matches model architecture
+            if layer_cache_config.model_depth != depth:
+                print(f"Warning: LayerCacheConfig model_depth ({layer_cache_config.model_depth}) doesn't match model depth ({depth}). Updating config.")
+                layer_cache_config.model_depth = depth
+            if layer_cache_config.num_stages != len(patch_nums):
+                print(f"Warning: LayerCacheConfig num_stages ({layer_cache_config.num_stages}) doesn't match patch_nums length ({len(patch_nums)}). Updating config.")
+                layer_cache_config.num_stages = len(patch_nums)
+            # Re-validate after updates
+            layer_cache_config.validate()
+        
+        self.layer_cache_config = layer_cache_config
         
         # Legacy cache compatibility
         self.use_cache = use_cache
