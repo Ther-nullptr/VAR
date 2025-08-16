@@ -17,7 +17,7 @@ from PIL import Image
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from models.var_cache_wrapper import VARCacheWrapper
+from models.var_enhanced_compatible import VAREnhancedCompatible
 from models.var_layer_cache_control import parse_layer_cache_spec, parse_layer_set_spec, parse_layer_blend_spec
 from models.basic_var_layer_control import LayerCacheConfig
 from models import VQVAE, build_vae_var
@@ -158,35 +158,47 @@ def main():
     
     print(f"Output directory: {output_path}")
     
-    # Build VAE and original VAR models
-    print("Building VAE and VAR models...")
-    vae, var_original = build_vae_var(
+    # Build VAE
+    print("Building VAE...")
+    vae, _ = build_vae_var(
         V=4096, Cvae=32, ch=160, share_quant_resi=4,    # hard-coded VQVAE hyperparameters
         device=device, patch_nums=patch_nums,
         num_classes=args.class_num, depth=args.model_depth, shared_aln=False,
     )
     
-    # Load checkpoints
+    # Load VAE checkpoint
     print(f"Loading VAE checkpoint from {args.vae_path}")
     vae.load_state_dict(torch.load(args.vae_path, map_location='cpu'), strict=True)
     vae.eval()
     for p in vae.parameters(): 
         p.requires_grad_(False)
     
+    # Create enhanced VAR model with fine-grained cache control
+    print("Creating enhanced VAR model with fine-grained cache control...")
+    var_model = VAREnhancedCompatible(
+        vae_local=vae,
+        layer_cache_config=layer_cache_config,
+        num_classes=args.class_num,
+        depth=args.model_depth,
+        patch_nums=patch_nums,
+        shared_aln=False
+    ).to(device)
+    
+    # Load VAR checkpoint
     print(f"Loading VAR checkpoint from {args.model_path}")
     var_checkpoint = torch.load(args.model_path, map_location='cpu')
-    var_original.load_state_dict(var_checkpoint, strict=True)
-    var_original.eval()
-    for p in var_original.parameters(): 
+    missing_keys, unexpected_keys = var_model.load_state_dict(var_checkpoint, strict=False)
+    
+    if missing_keys:
+        print(f"Missing keys: {missing_keys}")
+    if unexpected_keys:
+        print(f"Unexpected keys: {unexpected_keys}")
+    
+    var_model.eval()
+    for p in var_model.parameters():
         p.requires_grad_(False)
     
-    # Use the original VAR model directly
-    print("Using original VAR model...")
-    var_model = var_original
-    
-    # Print cache configuration for reference
-    print(f"Cache configuration ready: {layer_cache_config.get_cache_summary()}")
-    print("Note: Using original VAR model. Cache control features are documented but not active in this version.")
+    print("✅ Enhanced VAR model ready with active fine-grained cache control!")
     
     # Generate images
     print(f"Generating {args.num_samples} images...")
